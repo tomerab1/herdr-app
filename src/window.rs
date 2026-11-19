@@ -1473,6 +1473,20 @@ impl AppWindow {
         out
     }
 
+    /// Another client (a phone) may have taken the size of terminals shown
+    /// here: take it back for each one on screen (`TerminalView::reclaim_size`).
+    /// The window can stay active while the person uses the phone, so a click
+    /// or key counts as coming back too.
+    fn reclaim_sizes(&self, cx: &App) {
+        let size = |r: &Value| Some((r.get("cols")?.as_u64()?, r.get("rows")?.as_u64()?));
+        for t in self.terms.values() {
+            let view = t.view.read(cx);
+            if view.on_screen_this_frame() {
+                view.reclaim_size(self.live.get(&t.address).and_then(size));
+            }
+        }
+    }
+
     /// Makes `addr` the shown agent; a pane showing it also becomes the focused pane.
     fn focus_agent(&mut self, addr: &str) {
         if let Some(p) = self.model.pane_of(addr) {
@@ -4325,6 +4339,7 @@ impl AppWindow {
             self.window_active = active;
             if active {
                 self.sync(window, cx);
+                self.reclaim_sizes(cx);
             } else {
                 self.looked.clear();
             }
@@ -5648,6 +5663,7 @@ impl Render for AppWindow {
                 }
             }))
             .capture_key_down(cx.listener(|this, ev: &KeyDownEvent, window, cx| {
+                this.reclaim_sizes(cx);
                 if ev.keystroke.key == "escape" {
                     if this.pane_drag.is_some() {
                         this.cancel_pane_drag(cx);
@@ -5657,7 +5673,10 @@ impl Render for AppWindow {
                     }
                 }
             }))
-            .capture_any_mouse_down(cx.listener(|this, ev: &MouseDownEvent, _, _| this.pointer = ev.position))
+            .capture_any_mouse_down(cx.listener(|this, ev: &MouseDownEvent, _, cx| {
+                this.pointer = ev.position;
+                this.reclaim_sizes(cx);
+            }))
             .on_mouse_move(cx.listener(|this, ev: &MouseMoveEvent, window, cx| {
                 this.drag_window(ev, window);
                 if this.drag.is_none() {
@@ -7204,6 +7223,63 @@ mod tests {
         assert_ne!(started[0], json!(["node", "tool.js"]), "a tab runs it in a shell");
         assert_eq!(started[1], split, "right");
         assert_eq!(started[2], split, "down");
+    }
+
+    #[test]
+    fn coming_back_takes_back_the_size_another_client_took() {
+        in_own_process("reclaim_sizes");
+    }
+
+    /// Core sizes a terminal for the viewer that attached, typed, resized or
+    /// focused it last, so a phone opening Herdr shrinks it here. Coming back
+    /// to the window (it becomes active, or a click or key) tells core the size
+    /// of each terminal on screen again, where core reports another size.
+    #[gpui::test]
+    fn reclaim_sizes(cx: &mut gpui::TestAppContext) {
+        use serde_json::json;
+        if !running_alone("reclaim_sizes") {
+            return;
+        }
+        let (core, sent) = crate::hc::recording();
+        // The core passes frames on from a thread of its own.
+        let resizes = || -> Vec<(String, Vec<u8>)> {
+            std::iter::from_fn(|| sent.recv_timeout(std::time::Duration::from_millis(300)).ok())
+                .filter(|(_, kind, _)| *kind == crate::hc::RESIZE).map(|(t, _, p)| (t, p)).collect()
+        };
+        let (view, cx) = open_window_on(cx, core, "board", "", json!({
+            "id": "main", "type": "block", "content": { "tab": "active" }
+        }));
+        let live = |cols: u16, rows: u16| ["t1", "t2"].map(|a| (a.to_owned(), json!({"address": a, "state": "live", "cols": cols, "rows": rows})));
+        cx.update(|window, cx| view.update(cx, |this, cx| {
+            this.documents.entry(String::new()).or_default().available = true;
+            this.model.add_space("s1", "one", "", crate::model::Tab::new("a", "a", "pa", "t1"));
+            this.model.add_tab("s1", crate::model::Tab::new("b", "b", "pb", "t2"));
+            this.model.select_tab("a");
+            this.live.extend(live(200, 120));
+            this.sync(window, cx);
+        }));
+        cx.run_until_parked();
+        let ours = cx.update(|_, cx| view.read(cx).terms["pa"].view.read(cx).grid_size());
+        assert_ne!(ours, (60, 20));
+        let size = [ours.0.to_le_bytes(), ours.1.to_le_bytes()].concat();
+        // A phone attaches to both: core now sizes them for it.
+        cx.update(|_, cx| view.update(cx, |this, _| this.live.extend(live(60, 20))));
+        resizes();
+        cx.deactivate_window();
+        cx.update(|window, cx| view.update(cx, |this, cx| this.poll(window, cx)));
+        assert_eq!(resizes(), vec![], "leaving the window claims nothing");
+        // Activation reaches the window once the executor runs.
+        cx.update(|window, _| window.activate_window());
+        cx.run_until_parked();
+        cx.update(|window, cx| view.update(cx, |this, cx| this.poll(window, cx)));
+        assert_eq!(resizes(), vec![("t1".to_owned(), size.clone())], "only the terminal on screen, once");
+        // A click, too: the window can stay active while the phone is in use.
+        cx.simulate_mouse_down(gpui::point(gpui::px(5.), gpui::px(5.)), gpui::MouseButton::Left, gpui::Modifiers::none());
+        assert_eq!(resizes(), vec![("t1".to_owned(), size.clone())]);
+        // Core reports our size again: nothing more to take back.
+        cx.update(|_, cx| view.update(cx, |this, _| { this.live.insert("t1".into(), json!({"address": "t1", "state": "live", "cols": ours.0, "rows": ours.1})); }));
+        cx.simulate_mouse_down(gpui::point(gpui::px(5.), gpui::px(5.)), gpui::MouseButton::Left, gpui::Modifiers::none());
+        assert_eq!(resizes(), vec![]);
     }
 
     /// `tab.new {mod, focus: false}` adds the tab at the end of its space,

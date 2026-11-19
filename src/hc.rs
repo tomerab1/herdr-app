@@ -614,6 +614,45 @@ pub fn answering() -> (Arc<Core>, mpsc::Receiver<Value>) {
     (core, runs)
 }
 
+/// A core that attaches every terminal (channels 10, 11, ...) and answers any
+/// other call with `{}`. Every frame the app sends a terminal, it passes on to
+/// `sent`: `(terminal, kind, payload)`.
+#[cfg(test)]
+pub fn recording() -> (Arc<Core>, mpsc::Receiver<(String, u8, Vec<u8>)>) {
+    let (writer, frames) = mpsc::channel::<Vec<u8>>();
+    let (sent_tx, sent) = mpsc::channel();
+    let (lost_tx, lost) = async_channel::bounded(1);
+    std::mem::forget(lost_tx);
+    let routes = Arc::new(Mutex::new(Routes::default()));
+    let replies = routes.clone();
+    std::thread::spawn(move || {
+        let mut terminals: HashMap<u32, String> = HashMap::new();
+        for frame in frames {
+            let channel = u32::from_le_bytes(frame[..4].try_into().unwrap());
+            if channel != 0 {
+                let terminal = terminals.get(&channel).cloned().unwrap_or_default();
+                let _ = sent_tx.send((terminal, frame[4], frame[HEADER..].to_vec()));
+                continue;
+            }
+            let Ok(req) = serde_json::from_slice::<Value>(&frame[HEADER..]) else { continue };
+            let result = if req["method"] == "terminal.attach" {
+                let channel = 10 + terminals.len() as u32;
+                terminals.insert(channel, req["params"]["terminal"].as_str().unwrap_or_default().to_owned());
+                json!({ "channel": channel, "terminal": {} })
+            } else {
+                json!({})
+            };
+            let id = req["id"].as_u64().unwrap_or_default();
+            if let Some(tx) = replies.lock().unwrap().replies.remove(&id) {
+                let _ = tx.send(Ok(result));
+            }
+        }
+    });
+    let child = std::process::Command::new(std::env::current_exe().unwrap()).arg("--help").stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
+    let core = Arc::new(Core { hello: Value::Null, writer, routes, next_id: AtomicU64::new(1), child: Mutex::new(child), lost });
+    (core, sent)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
