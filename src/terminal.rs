@@ -679,6 +679,25 @@ impl TerminalView {
         self.shown_in.get() == FRAME.load(Ordering::Relaxed)
     }
 
+    /// Core sizes a terminal for the viewer that attached, typed, resized or
+    /// focused it last, so another client (a phone) can leave it smaller than
+    /// this pane. Telling core this pane's size again makes this window the
+    /// one that counts. `core` is the size core reports; a match sends nothing.
+    pub fn reclaim_size(&self, core: Option<(u64, u64)>) {
+        let g = self.grid.borrow();
+        let Some(channel) = g.channel else { return };
+        let ours = (g.vt.cols, g.vt.rows);
+        if core.is_some_and(|size| size != (u64::from(ours.0), u64::from(ours.1))) {
+            g.core.resize(channel, ours.0, ours.1);
+        }
+    }
+
+    #[cfg(test)]
+    pub fn grid_size(&self) -> (u16, u16) {
+        let g = self.grid.borrow();
+        (g.vt.cols, g.vt.rows)
+    }
+
     fn send(&self, bytes: &[u8]) {
         self.typed_at.set(Some(Instant::now()));
         let mut g = self.grid.borrow_mut();
