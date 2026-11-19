@@ -1,6 +1,24 @@
+// The tab bar, with tab groups.
+//
+// A group is a colored chip before its tabs. While a tab is dragged, the bar
+// shows "+ New group" and, for a grouped tab, "Remove from group"; dropping a
+// tab on a grouped tab or a chip joins that group, on an ungrouped tab leaves
+// it. Click a chip to fold the group: its tabs are settled (tab.settle), so
+// they keep running, next/prev skip them, and Herdr brings one back when its
+// agent needs the person. The tab shown when folding stays until it's left.
+// Double-click a chip to rename it.
+//
+// Groups live in shared("tab-groups") on this screen:
+// { groups: { [id]: { name, color, collapsed, kept } }, of: { [tabId]: groupId } }.
+
 import { View, div, svg, image } from "gpui-kit";
-import { h_flex, ScrollHandle } from "gpui-base";
-import { spaces, panes, run, openOverlay, theme, window, shared, layout, settings } from "herdr";
+import { h_flex, ScrollHandle, InputState, Input } from "gpui-base";
+import { spaces, panes, run, openOverlay, theme, window, shared, setShared, layout, settings } from "herdr";
+
+const KEY = "tab-groups";
+// Theme colors, so groups follow light and dark themes.
+const COLORS = ["ansi4", "ansi2", "ansi3", "ansi5", "ansi6", "ansi1"];
+const CLICK_WAIT = 250;
 
 function find(node, id) {
   if (node?.id === id) return node;
@@ -27,12 +45,34 @@ function label(tab, lead) {
   return (tab.name === prog || !tab.named) && telling ? live : base;
 }
 
+const isObject = (v) => v && typeof v === "object" && !Array.isArray(v);
+
+function load() {
+  const s = shared(KEY);
+  return {
+    groups: isObject(s?.groups) ? { ...s.groups } : {},
+    of: isObject(s?.of) ? { ...s.of } : {},
+  };
+}
+
+// Forgets tabs that are gone and groups with no tabs left.
+function save(state) {
+  const live = new Set(spaces().flatMap((s) => (s.tabs ?? []).map((t) => t.id)));
+  const of = Object.fromEntries(Object.entries(state.of).filter(([tab, g]) => live.has(tab) && state.groups[g]));
+  const used = new Set(Object.values(of));
+  const groups = Object.fromEntries(Object.entries(state.groups).filter(([g]) => used.has(g)));
+  setShared(KEY, { groups, of });
+}
+
 export default class Tabs extends View {
   init() {
-    this.pressed = null;
+    this.pressed = null;   // the tab id a press started on
+    this.dragging = false; // the press moved: show the "+ group" zone
+    this.renaming = null;  // the group whose name is being edited
+    this.click = null;     // a chip click waiting to see if it's a double-click
     this.scroll = ScrollHandle.new();
     try { this.panels = JSON.parse(localStorage.getItem("panels") ?? "{}"); } catch { this.panels = {}; }
-    if (!this.panels || typeof this.panels !== "object" || Array.isArray(this.panels)) this.panels = {};
+    if (!isObject(this.panels)) this.panels = {};
     this.swipe = { acc: 0, steps: 0, at: 0, last: 0 };
   }
 
@@ -87,34 +127,133 @@ export default class Tabs extends View {
     localStorage.setItem("panels", JSON.stringify(this.panels));
   }
 
+  endDrag() {
+    const from = this.pressed;
+    this.pressed = null;
+    this.dragging = false;
+    return from;
+  }
+
+  // Puts tab `id` in group `gid` (null: no group) at the place of `at`.
+  place(id, gid, at, space) {
+    const st = load();
+    if (gid) st.of[id] = gid; else delete st.of[id];
+    save(st);
+    const index = at ? space.tabs.findIndex((x) => x.id === at) + 1 : 0;
+    if (index > 0 && at !== id) run("tab.move", { id, index });
+  }
+
+  // A tab leaving its group goes right after the group's other tabs, so it
+  // doesn't split the group in two.
+  leaveGroup(st, id, space) {
+    const gid = st.of[id];
+    delete st.of[id];
+    const tabs = space.tabs, from = tabs.findIndex((t) => t.id === id);
+    const last = tabs.reduce((at, t, i) => (st.of[t.id] === gid ? i : at), -1);
+    if (gid && last >= 0 && from >= 0) run("tab.move", { id, index: from < last ? last + 1 : last + 2 });
+  }
+
+  ungroup(id, space) {
+    const st = load();
+    if (!st.of[id]) return;
+    this.leaveGroup(st, id, space);
+    save(st);
+  }
+
+  newGroup(id, space) {
+    const st = load();
+    if (st.of[id]) this.leaveGroup(st, id, space);
+    const gid = `g${Date.now().toString(36)}`;
+    const taken = new Set(Object.values(st.groups).map((g) => g.color));
+    const n = Object.keys(st.groups).length;
+    const color = COLORS.find((c) => !taken.has(c)) ?? COLORS[n % COLORS.length];
+    st.groups[gid] = { name: `Group ${n + 1}`, color, collapsed: false };
+    st.of[id] = gid;
+    save(st);
+  }
+
+  // Folding settles the group's tabs and never switches tabs: the one shown
+  // stays beside the chip (`kept`) until the person leaves it, then folds too.
+  toggle(gid, spaceId) {
+    const st = load(), g = st.groups[gid];
+    const tabs = spaces().find((s) => s.id === spaceId)?.tabs;
+    if (!g || !tabs) return;
+    const members = tabs.filter((t) => st.of[t.id] === gid);
+    if (!g.collapsed) {
+      for (const t of members) if (!t.active) run("tab.settle", { id: t.id });
+      g.kept = members.find((t) => t.active)?.id ?? null;
+    } else {
+      for (const t of members) run("tab.unsettle", { id: t.id });
+      g.kept = null;
+    }
+    g.collapsed = !g.collapsed;
+    save(st);
+  }
+
+  // In a folded group, the shown tab is kept beside the chip; once another
+  // tab is shown, it folds. Tabs Herdr brought back for an agent stay out
+  // until they've been shown and left.
+  foldKept(st, shown) {
+    let changed = false;
+    for (const [gid, g] of Object.entries(st.groups)) {
+      const members = shown.filter((t) => st.of[t.id] === gid);
+      if (!members.length) continue;
+      const active = g.collapsed ? members.find((t) => t.active)?.id ?? null : null;
+      if ((g.kept ?? null) === active) continue;
+      const left = members.find((t) => t.id === g.kept);
+      if (g.collapsed && left && !left.settled) run("tab.settle", { id: left.id });
+      g.kept = active;
+      changed = true;
+    }
+    if (changed) save(st);
+  }
+
+  startRename(gid, name) {
+    this.click = null;
+    this.renaming = gid;
+    this.input = InputState.new({ value: name });
+    this.input.set_selected_range({ start: 0, end: name.length });
+    this.input.on("submit", (_e, cx) => this.finishRename(true, cx));
+    this.input.on("blur", (_e, cx) => this.finishRename(true, cx));
+    this.input.focus();
+  }
+
+  finishRename(keep, cx) {
+    const gid = this.renaming;
+    if (!gid) return;
+    this.renaming = null;
+    const name = this.input.value().trim();
+    if (keep && name) {
+      const st = load();
+      if (st.groups[gid]) { st.groups[gid].name = name; save(st); }
+    }
+    cx?.notify();
+  }
+
   render() {
     const t = theme();
     const space = spaces().find(p => p.active);
     const shown = space?.tabs ?? [];
-    const active = shown.findIndex(tab => tab.active);
-    const selected = shown[active]?.id;
-    if (selected !== this.selected || active !== this.selectedIndex) {
-      this.selected = selected;
-      this.selectedIndex = active;
-      if (active >= 0) this.scroll.scroll_to_item(active);
-    }
+    const st = load();
+    this.foldKept(st, shown);
+    const groupOf = (tab) => (st.groups[st.of[tab.id]] ? st.of[tab.id] : null);
     const stop = (_e, cx) => cx.stop_propagation();
     const button = (id, label, action) => div().id(id).size(26).flex_none().flex().items_center().justify_center().rounded(6).text_color(t.dim).hover(s => s.bg(t.hover).text_color(t.foreground))
       .on_mouse_down("left", stop).on_click(action).child(label);
-    const item = (c, i) => {
+
+    const item = (c) => {
       const lead = panes().find(p => p.tab === c.id && p.program?.agent) ?? panes().find(p => p.tab === c.id);
       const program = lead?.program;
       const name = label(c, lead);
       return h_flex().id(`tab-${c.id}`).h(29).px(10).gap(7).rounded(7).items_center().flex_none().text_size(12.8)
-        // A rename or status dot on this or an earlier tab can push the active one out.
-        .when(i <= active, el => el.on_size_change((_size, cx) => { this.scroll.scroll_to_item(active); cx.notify(); }))
         .border(1).border_color(c.active ? t.border : t.chrome).bg(c.active ? t.raised : t.chrome).text_color(c.active ? t.foreground : t.muted)
         .hover(s => s.bg(t.hover))
-        .on_mouse_down("left", (e, cx) => { cx.stop_propagation(); this.pressed = i; if (e.click_count === 2) run("tab.rename", { id: c.id }); })
-        .on_mouse_up("left", () => {
-          const from = this.pressed; this.pressed = null;
-          if (from !== null && from !== i) run("tab.move", { id: shown[from].id, index: space.tabs.findIndex(x => x.id === c.id) + 1 });
+        .on_mouse_down("left", (e, cx) => { cx.stop_propagation(); this.pressed = c.id; this.dragging = false; if (e.click_count === 2) run("tab.rename", { id: c.id }); })
+        .on_mouse_up("left", (_e, cx) => {
+          const from = this.endDrag();
+          if (from && from !== c.id) this.place(from, groupOf(c), c.id, space);
           else run("tab.select", { id: c.id });
+          cx.notify();
         })
         .on_mouse_down("right", (_e, cx) => { cx.stop_propagation(); openOverlay({ mod: "menu", kind: "popup", width: 200, props: { tab: "tab", target: { id: c.id, space: space.id } } }); })
         .when(Boolean(program?.icon), el => el.child(program.tint ? svg(program.icon).size(14).text_color(t.muted) : image(program.icon).size(14)))
@@ -123,6 +262,89 @@ export default class Tabs extends View {
         .when(c.status === "blocked" || c.status === "done", el => el.child(div().size(6).rounded(3).bg(t[c.status])))
         .when(c.active, el => el.child(div().id(`close-${c.id}`).text_color(t.dim).on_mouse_down("left", stop).on_click((_e, cx) => { cx.stop_propagation(); run("tab.close", { id: c.id }); }).child(svg("mods/pane/close.svg").size(12))));
     };
+
+    // Tinted like the agents list's "Needs you" badge.
+    const chip = (gid, members) => {
+      const g = st.groups[gid], color = t[g.color] ?? t.accent;
+      const hidden = members.filter((m) => m.settled).length;
+      const title = this.renaming === gid
+        ? div().id(`group-name-${gid}`).w(110).on_mouse_down("left", stop)
+          .on_key_down((e, cx) => { if (e.key === "escape") { cx.stop_propagation(); this.finishRename(false, cx); } })
+          .child(Input.new(this.input).h(20).text_size(12.5).text_color(t.foreground))
+        : div().max_w(140).truncate().child(g.name);
+      return h_flex().id(`group-${gid}`).h(22).px(8).gap(5).rounded(6).items_center().flex_none()
+        .text_size(12).font_semibold().bg(color + "26").text_color(color).hover(s => s.bg(color + "40"))
+        .on_mouse_down("left", (e, cx) => {
+          cx.stop_propagation();
+          if (e.click_count === 2) { this.startRename(gid, g.name); cx.notify(); }
+        })
+        .on_mouse_up("left", (e, cx) => {
+          const from = this.endDrag();
+          if (from) {
+            const first = members[0];
+            this.place(from, gid, first && first.id !== from ? first.id : null, space);
+          } else if (e.click_count === 1 && this.renaming !== gid) {
+            // Wait: a second click makes this a rename, which must not fold the group.
+            const click = this.click = {};
+            cx.spawn(async (cx) => {
+              await cx.sleep(CLICK_WAIT);
+              if (this.click === click) { this.click = null; this.toggle(gid, space.id); }
+            });
+          }
+          cx.notify();
+        })
+        .child(title)
+        .when(g.collapsed && hidden > 0, el => el.child(div().opacity(0.7).child(String(hidden))));
+    };
+
+    // Runs of tabs in the same group sit together, after the group's chip.
+    // A folded group shows only its tabs that came back (an agent needs you).
+    const runs = [];
+    for (const c of shown) {
+      const gid = groupOf(c);
+      const last = runs[runs.length - 1];
+      if (gid && last?.gid === gid) last.tabs.push(c);
+      else runs.push({ gid, tabs: [c] });
+    }
+    const chipped = new Set();
+    const children = [];
+    let activeChild = -1;
+    for (const r of runs) {
+      if (!r.gid) {
+        for (const c of r.tabs) {
+          if (c.active) activeChild = children.length;
+          children.push(item(c));
+        }
+        continue;
+      }
+      const g = st.groups[r.gid];
+      const members = shown.filter((c) => groupOf(c) === r.gid);
+      const tabs = r.tabs.filter((c) => !(g.collapsed && c.settled));
+      if (r.tabs.some((c) => c.active)) activeChild = children.length;
+      const box = h_flex().id(`run-${r.gid}-${children.length}`).h(29).mx(4).gap(3).items_center().flex_none()
+        .when(!g.collapsed && tabs.length > 0, el => el.border_b(2).border_color(t[g.color] ?? t.accent))
+        .when(!chipped.has(r.gid), el => el.child(chip(r.gid, members)))
+        .children(tabs.map(item));
+      chipped.add(r.gid);
+      children.push(box);
+    }
+    if (this.dragging) {
+      const zone = (id, text, act) => h_flex().id(id).h(22).px(8).ml(4).flex_none().items_center().rounded(6)
+        .border(1).border_dashed().border_color(t.border).text_size(12).text_color(t.muted)
+        .hover(s => s.bg(t.hover).text_color(t.foreground))
+        .on_mouse_up("left", (_e, cx) => { const from = this.endDrag(); if (from) act(from); cx.notify(); })
+        .child(text);
+      children.push(zone("tab-new-group", "+ New group", (from) => this.newGroup(from, space)));
+      if (st.of[this.pressed]) children.push(zone("tab-ungroup", "Remove from group", (from) => this.ungroup(from, space)));
+    }
+
+    const selected = shown.find(tab => tab.active)?.id;
+    if (selected !== this.selected || activeChild !== this.selectedIndex) {
+      this.selected = selected;
+      this.selectedIndex = activeChild;
+      if (activeChild >= 0) this.scroll.scroll_to_item(activeChild);
+    }
+
     const root = layout(), sidebar = find(root, "sidebar"), w = window();
     // Old saved rails and a dragged-narrow sidebar can be smaller than the window buttons.
     const lightsPadding = w?.platform === "macos" && w.titlebar === "none" && !w.fullscreen && root?.traffic_lights
@@ -142,11 +364,14 @@ export default class Tabs extends View {
         }).child(svg(icon).size(14)).child(label);
     };
     return h_flex().size_full().min_w(0).px(10).pl(lightsPadding).gap(3).items_center().bg(t.chrome).border_b(1).border_color(t.border)
-      .on_mouse_up("left", () => { this.pressed = null; })
+      .on_mouse_move((_e, cx) => { if (this.pressed && !this.dragging) { this.dragging = true; cx.notify(); } })
+      .on_mouse_up("left", (_e, cx) => { this.endDrag(); cx.notify(); })
+      // Dragging off the bar cancels the drag.
+      .on_hover((hovered, cx) => { if (!hovered && this.pressed) { this.endDrag(); cx.notify(); } })
       .on_scroll_wheel(e => this.wheel(e))
       .child(h_flex().id("tab-scroll").flex_1().min_w(0).h_full().items_center().gap(3).overflow_x_scrollbar().track_scroll(this.scroll)
-        .on_size_change((_size, cx) => { if (active >= 0) { this.scroll.scroll_to_item(active); cx.notify(); } })
-        .children(shown.map(item)))
+        .on_size_change((_size, cx) => { if (this.selectedIndex >= 0) { this.scroll.scroll_to_item(this.selectedIndex); cx.notify(); } })
+        .children(children))
       .child(button("tab-new", "+", () => openOverlay({ mod: "new-menu", kind: "popup", width: 250, height: 512 })))
       .when(enabled.includes("files"), el => el.child(panelButton("files", "Files", "mods/files/file.svg")))
       .when(enabled.includes("changes"), el => el.child(panelButton("changes", "Changes", "mods/changes/changes.svg")))

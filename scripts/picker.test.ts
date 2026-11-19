@@ -23,11 +23,12 @@ const source = await readFile(new URL("../defaults/mods/picker/main.js", import.
 const element = () => new Element();
 const commands: unknown[][] = [];
 let testSpaces: any[] = [];
+let testAgents: any[] = [];
 let closed = 0;
 const values: Record<string, any> = {
   View: class {}, div: element, svg: element, v_flex: element, h_flex: element,
   Input: { new: element }, InputState: { new: () => ({ handlers: {} as Record<string, any>, on(name: string, handler: any) { this.handlers[name] = handler; }, focus() {} }) },
-  agents: () => [], spaces: () => testSpaces, terminals: () => [], theme: () => ({ hover: "hover" }),
+  agents: () => testAgents, spaces: () => testSpaces, terminals: () => [], theme: () => ({ hover: "hover" }),
   settings: () => ({ zoom: 1.2 }), props: () => ({}), shared: () => ({}),
   setShared() {}, closeOverlay() { closed++; }, openOverlay() {}, run(...args: unknown[]) { commands.push(args); }, hc() {},
 };
@@ -188,4 +189,23 @@ test("picker preserves small pixel touchpad deltas", () => {
     list.calls.on_scroll_wheel[0]({ delta: { y: delta } }, cx);
     expect(view.scroll).toBe(-delta);
   }
+});
+
+test("picker lists open sessions whose messages match, and Enter goes to that agent", () => {
+  const view = picker(0);
+  testSpaces = [{ id: "w", name: "claude", tabs: [{ id: "c1", name: "dlocal" }] }];
+  testAgents = [{ address: "t9", tab: "c1" }];
+  // What searchSessions found; the search itself runs rg on the real transcripts.
+  view.hits = [{ address: "t9", count: 2, time: "2026-11-19T10:00:00Z", snippet: { before: "…the ", match: "pricing", after: " mode" } }];
+  view.input.value = () => "pricing";
+  view.input.handlers.change({}, cx);
+  expect(find(view.render(), "pk-msg-t9")).toBeDefined();
+  commands.length = 0;
+  view.input.handlers.submit({}, cx);
+  expect(commands).toEqual([["tab.select", { id: "c1" }], ["pane.focus", { terminal: "t9" }]]);
+  // Under three characters there's no message search.
+  view.input.value = () => "pr";
+  view.input.handlers.change({}, cx);
+  expect(find(view.render(), "pk-msg-t9")).toBeUndefined();
+  testAgents = [];
 });

@@ -122,8 +122,9 @@ the highlighted line shows where it will land.
   has one or more; closing the last one closes the space (it stays in
   `recent`).
 - A tab can be **settled** (`tab.settle`): put away on this screen, still running;
-  `settled` on each tab. The shipped layouts don't use it (they list every
-  tab); a mod that does can hide or fold settled tabs. Showing one, or an
+  `settled` on each tab. The shipped `tabs` mod settles the tabs of a folded
+  tab group (groups are its own, in shared `tab-groups`); a mod can hide or
+  fold settled tabs. Showing one, or an
   agent in it needing the user, brings it back.
 - A **pane** is a terminal on screen, or a **mod** beside them (a markdown
   viewer, a board, a git panel): `pane.split {direction, mod, props}`. A
@@ -921,8 +922,9 @@ has 124 programs (agents, editors, runtimes, tools, databases, infra);
   (tinted with the text color). Saving an asset under `mods/` updates every
   mod showing it, including images that were missing or invalid on first load.
 - The defaults are mods too, read them as examples: `spaces`, `agents`,
-  `tabs` (the tab bar), `menu`, `prompt`, `confirm`, `help`, `toast`,
-  Terminals' `picker`, `peek`, and `pane` (an
+  `tabs` (the tab bar, with tab groups), `menu`, `prompt`, `confirm`, `help`, `toast`,
+  `picker` (go to a tab; typing also searches the open Claude Code sessions'
+  messages), `peek`, and `pane` (an
   example pane header, not used by the default layouts), and `worktree`
   (git worktrees as spaces: the space menu's and the + menu's New worktree,
   Open worktree (the repo's checkouts, filtered; one already shown is gone

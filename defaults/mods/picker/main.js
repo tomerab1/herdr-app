@@ -3,10 +3,98 @@
 // fold into "earlier". Type to filter, ↑/↓ and Enter to go, ctrl+d to close
 // a tab, Esc to leave. Last rows: new work (a tab here, a space on this
 // computer or on each connected machine).
+//
+// Find in sessions: typing three or more characters also searches the
+// conversations of the Claude Code sessions open in tabs here (your messages
+// and Claude's written replies, not tool output) and lists matching sessions
+// under "In messages", newest match first. Enter goes to that agent.
 
 import { View, div, svg } from "gpui-kit";
 import { v_flex, h_flex, InputState, Input } from "gpui-base";
-import { agents, spaces, terminals, run, hc, theme, settings, props, closeOverlay, openOverlay, shared, setShared } from "herdr";
+import { agents, spaces, terminals, run, hc, exec, readTextFile, home, theme, settings, props, closeOverlay, openOverlay, shared, setShared } from "herdr";
+import * as fs from "fs/promises";
+
+const MIN_QUERY = 3;
+const SEARCH_WAIT = 200;
+// Per session: matching lines read, and the longest line read (longer ones are
+// tool output or big pastes). One rg per session keeps each under exec's 8 MiB.
+const MATCHES_READ = 200;
+const LINE_MAX = 30000;
+
+const isPickable = (r) => r.kind !== "head" && r.kind !== "mhead";
+
+// Claude Code writes ~/.claude/sessions/<pid>.json for each running session.
+// A session belongs to the terminal whose program it is, or whose shell
+// started it. Returns { address, file } for each open one here.
+async function openSessions() {
+  const dir = `${home()}/.claude/sessions`;
+  const names = await fs.readdir(dir).catch(() => []);
+  const found = [];
+  for (const name of names.filter((n) => n.endsWith(".json"))) {
+    try {
+      const s = JSON.parse(await readTextFile(`${dir}/${name}`));
+      if (s?.pid && s.sessionId && s.cwd) found.push({ pid: Number(s.pid), id: s.sessionId, cwd: s.cwd });
+    } catch {}
+  }
+  if (!found.length) return [];
+  const ps = await exec("ps", ["-o", "pid=,ppid=", "-p", found.map((s) => s.pid).join(",")]).catch(() => null);
+  const parent = new Map((ps?.stdout ?? "").trim().split("\n").filter(Boolean).map((l) => l.trim().split(/\s+/).map(Number)));
+  const live = terminals().filter((x) => x.state === "live" && !String(x.address).includes("/"));
+  const out = [];
+  for (const s of found) {
+    if (!parent.has(s.pid)) continue;
+    const term = live.find((x) => x.pid === s.pid || x.pid === parent.get(s.pid) || x.foreground?.pid === s.pid);
+    if (term) out.push({ address: term.address, file: `${home()}/.claude/projects/${s.cwd.replace(/[^A-Za-z0-9]/g, "-")}/${s.id}.jsonl` });
+  }
+  return out;
+}
+
+// The words a person or Claude wrote in one transcript line: typed messages
+// and text replies, not tool calls, tool output, or text Claude Code adds
+// (<system-reminder>, <command-name>, ...).
+function messageTexts(e) {
+  if ((e?.type !== "user" && e?.type !== "assistant") || e.isMeta || e.isSidechain) return [];
+  const c = e.message?.content;
+  const blocks = typeof c === "string" ? [c] : Array.isArray(c) ? c.filter((b) => b?.type === "text").map((b) => b.text) : [];
+  return blocks.filter((s) => typeof s === "string" && !s.trimStart().startsWith("<"));
+}
+
+function snippet(text, at, length) {
+  const flat = (s) => s.replace(/\s+/g, " ");
+  const start = Math.max(0, at - 40);
+  return {
+    before: (start > 0 ? "…" : "") + flat(text.slice(start, at)).trimStart(),
+    match: flat(text.slice(at, at + length)),
+    after: flat(text.slice(at + length, at + length + 120)),
+  };
+}
+
+// How many of one transcript's messages match, and the newest one; null for none.
+async function searchSession(query, session) {
+  const r = await exec("rg", ["--no-messages", "--no-filename", "-i", "-F", "-M", String(LINE_MAX), "-m", String(MATCHES_READ), "-e", query, "--", session.file], { timeout: 15000 }).catch(() => null);
+  const q = query.toLowerCase();
+  let hit = null;
+  for (const line of (r?.stdout ?? "").split("\n")) {
+    if (!line.startsWith("{") || line.includes('"tool_result"')) continue;
+    let e;
+    try { e = JSON.parse(line); } catch { continue; }
+    for (const text of messageTexts(e)) {
+      const at = text.toLowerCase().indexOf(q);
+      if (at < 0) continue;
+      hit ??= { count: 0, address: session.address };
+      hit.count++;
+      hit.snippet = snippet(text, at, query.length);
+      hit.time = e.timestamp ?? "";
+    }
+  }
+  return hit;
+}
+
+// The open sessions whose messages match, newest match first.
+async function searchSessions(query, sessions) {
+  const hits = await Promise.all(sessions.map((s) => searchSession(query, s)));
+  return hits.filter(Boolean).sort((a, b) => String(b.time).localeCompare(String(a.time)));
+}
 
 const MARK = { ansi6: "#22a99a", ansi3: "#e3814f", ansi4: "#5b8def", ansi5: "#8b7cf6", ansi2: "#3fae6a", ansi1: "#d9649a" };
 
@@ -37,13 +125,15 @@ function spaceColor(t, p) {
 export default class Picker extends View {
   init(_props, cx) {
     this.filter = "";
-    this.input = InputState.new({ placeholder: "Go to a tab, space or agent…" });
+    this.input = InputState.new({ placeholder: "Go to a tab, or search your sessions' messages…" });
+    this.hits = [];
     this.input.on("change", (_e, cx) => {
       this.filter = this.input.value();
-      this.at = this.filter ? Math.max(0, this.rows().filter(r => r.kind !== "head").findIndex(r => r.kind === "ctx")) : 0;
+      this.at = this.filter ? Math.max(0, this.rows().filter(isPickable).findIndex(r => r.kind === "ctx")) : 0;
+      this.searchSoon(cx);
       cx.notify();
     });
-    this.input.on("submit", (_e, cx) => this.go(this.rows().filter(r => r.kind !== "head")[this.at], cx));
+    this.input.on("submit", (_e, cx) => this.go(this.rows().filter(isPickable)[this.at], cx));
     this.input.focus();
     cx.timer.after(600, () => this.input.focus());
     this.at = null;
@@ -62,6 +152,27 @@ export default class Picker extends View {
 
   close() {
     closeOverlay(props().overlay);
+  }
+
+  // Searches once typing pauses; a newer query makes an older one's results moot.
+  searchSoon(cx) {
+    const query = this.filter.trim();
+    const search = this.search = {};
+    if (query.length < MIN_QUERY) {
+      this.hits = [];
+      return;
+    }
+    cx.spawn(async (cx) => {
+      await cx.sleep(SEARCH_WAIT);
+      if (this.search !== search) return;
+      const hits = await searchSessions(query, await openSessions()).catch(() => []);
+      if (this.search !== search) return;
+      this.hits = hits;
+      // With no tab matching by name, start on the first message match.
+      const rows = this.rows().filter(isPickable);
+      if (rows[this.at]?.kind !== "ctx") this.at = Math.max(0, rows.findIndex((r) => r.kind === "msg"));
+      cx.notify();
+    });
   }
 
   rows() {
@@ -96,6 +207,15 @@ export default class Picker extends View {
       out.push({ kind: "earlier", count: quiet.length });
       if (this.showEarlier || f) quiet.forEach(add);
     }
+    const found = this.hits.map((hit) => {
+      const tabId = all.find((a) => a.address === hit.address)?.tab ?? live.find((x) => x.address === hit.address)?.labels?.["herdr.tab"];
+      const w = spaces().find((s) => s.tabs.some((c) => c.id === tabId));
+      return w && { kind: "msg", hit, w, ctx: w.tabs.find((c) => c.id === tabId) };
+    }).filter(Boolean);
+    if (f.trim().length >= MIN_QUERY && found.length) {
+      out.push({ kind: "mhead" });
+      out.push(...found);
+    }
     out.push({ kind: "new" });
     out.push({ kind: "space", machine: null });
     for (const m of this.machines) out.push({ kind: "space", machine: m });
@@ -105,7 +225,7 @@ export default class Picker extends View {
   go(r, cx) {
     if (!r) return;
     if (r.kind === "earlier") {
-      this.at = this.rows().filter(r => r.kind !== "head").findIndex(r => r.kind === "earlier");
+      this.at = this.rows().filter(isPickable).findIndex(r => r.kind === "earlier");
       this.showEarlier = !this.showEarlier;
       this.input.focus();
       cx.notify();
@@ -113,7 +233,10 @@ export default class Picker extends View {
     }
     this.close();
     if (r.kind === "ctx") run("tab.select", { id: r.ctx.id });
-    else if (r.kind === "new") run("tab.new");
+    else if (r.kind === "msg") {
+      run("tab.select", { id: r.ctx.id });
+      run("pane.focus", { terminal: r.hit.address });
+    } else if (r.kind === "new") run("tab.new");
     else if (r.kind === "space") run("space.new", { machine: r.machine ?? "" });
   }
 
@@ -125,7 +248,7 @@ export default class Picker extends View {
   render() {
     const t = theme();
     const rows = this.rows();
-    const pickable = rows.filter((r) => r.kind !== "head");
+    const pickable = rows.filter(isPickable);
     // Opens on where you are.
     if (this.at === null) this.at = Math.max(0, pickable.findIndex((r) => r.kind === "ctx" && r.w.active && r.ctx.active));
     this.at = Math.min(this.at, pickable.length - 1);
@@ -133,7 +256,7 @@ export default class Picker extends View {
     // One continuous strip: each row (and the group title before it) at a fixed
     // y. Scrolling moves the strip only as far as it takes to keep the selected
     // row in view, so the arrows can't run the selection off the list.
-    const H = { head: 29, earlier: 35, new: 36, ctx: 32, space: 32 };
+    const H = { head: 29, mhead: 29, earlier: 35, new: 36, ctx: 32, msg: 50, space: 32 };
     const tops = [];
     let y = 0;
     rows.forEach((r) => { tops.push(y); y += H[r.kind] ?? 32; });
@@ -154,6 +277,32 @@ export default class Picker extends View {
     const visible = (i) => !fixed || (tops[i] + (H[rows[i].kind] ?? 32) > this.scroll && tops[i] < this.scroll + height);
 
     const row = (r) => {
+      if (r.kind === "mhead") {
+        return h_flex().px(10).pt(10).pb(3).items_center().text_size(11).font_semibold().text_color(t.dim).child("In messages");
+      }
+      if (r.kind === "msg") {
+        const { hit } = r, s = hit.snippet;
+        return v_flex()
+          .id(`pk-msg-${hit.address}`)
+          .mx(4)
+          .px(10)
+          .h(50)
+          .rounded(7)
+          .justify_center()
+          .gap(2)
+          .cursor_pointer()
+          .when(r === sel, (el) => el.bg(t.hover))
+          .hover((st) => st.bg(t.hover))
+          .on_click(() => this.go(r))
+          .child(h_flex().gap(10).items_center()
+            .child(this.glyph(t, r.ctx.status))
+            .child(div().flex_1().truncate().text_color(t.foreground).child(`${r.w.name} · ${r.ctx.name}`))
+            .child(div().text_size(11).text_color(t.dim).child(hit.count >= MATCHES_READ ? `${MATCHES_READ}+` : String(hit.count))))
+          .child(h_flex().pl(22).text_size(11.5).text_color(t.muted).overflow_hidden().whitespace_nowrap()
+            .child(s.before)
+            .child(div().flex_none().font_semibold().text_color(t.accent).child(s.match))
+            .child(div().truncate().child(s.after)));
+      }
       if (r.kind === "head") {
         return h_flex()
           .px(10)
